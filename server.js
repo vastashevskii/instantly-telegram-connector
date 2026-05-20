@@ -19,16 +19,72 @@ function telegramUrl(method) {
   return `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
 }
 
-// Strip HTML tags and escape special chars so Telegram doesn't choke
-function sanitize(str) {
+function escapeHtml(str) {
   if (!str) return "";
-  if (typeof str !== "string") str = JSON.stringify(str);
-  return str
+  return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .trim()
-    .slice(0, 1000);
+    .replace(/>/g, "&gt;");
+}
+
+// Extract clean plain text from body field
+// Instantly returns body as either a string or {text, html} object
+function extractBody(raw) {
+  let text = "";
+
+  if (!raw) return "";
+
+  if (typeof raw === "string") {
+    // Try to parse as JSON first (sometimes it's a stringified object)
+    try {
+      const parsed = JSON.parse(raw);
+      text = parsed.text || parsed.html || raw;
+    } catch {
+      text = raw;
+    }
+  } else if (typeof raw === "object") {
+    text = raw.text || raw.html || JSON.stringify(raw);
+  }
+
+  // Strip HTML tags if any slipped through
+  text = text.replace(/<[^>]*>/g, "");
+  // Convert literal \n strings to real newlines
+  text = text.replace(/\\n/g, "\n");
+  // Collapse more than 2 consecutive newlines
+  text = text.replace(/\n{3,}/g, "\n\n");
+
+  return text.trim();
+}
+
+// Split body into: their reply vs the quoted thread below
+function splitReplyAndThread(body) {
+  // Common quoted reply delimiters
+  const delimiters = [
+    /^-{3,}/m,                          // --- or ----
+    /^_{3,}/m,                          // ___
+    /^From:\s/m,                        // From: header in quoted thread
+    /^On .+ wrote:/m,                   // On [date], [name] wrote:
+    /^\[.*\]\s*wrote:/m,                // [email] wrote:
+    /^>{1,}/m,                          // > quoted lines
+  ];
+
+  for (const delimiter of delimiters) {
+    const match = body.search(delimiter);
+    if (match > 20) { // at least 20 chars of actual reply content
+      return {
+        reply: body.slice(0, match).trim(),
+        thread: body.slice(match).trim(),
+      };
+    }
+  }
+
+  return { reply: body, thread: null };
+}
+
+function formatDate(timestamp) {
+  if (!timestamp) return "Unknown time";
+  const d = new Date(timestamp);
+  return d.toUTCString().replace(" GMT", " UTC");
 }
 
 async function sendTelegram(text) {
@@ -59,36 +115,52 @@ async function pollInstantly() {
     console.log(`[${new Date().toISOString()}] Found ${emails.length} replies`);
   } catch (err) {
     console.error("Instantly fetch error:", err.response?.data || err.message);
-    return; // bail early, don't crash
+    return;
   }
 
   for (const email of emails) {
     const replyId = email.id;
     if (!replyId || notifiedReplies.has(replyId)) continue;
 
-    // Mark as notified FIRST - so even if Telegram send fails, we don't retry infinitely
+    // Mark notified before send to avoid retry loops
     notifiedReplies.add(replyId);
 
-    const leadEmail = sanitize(email.from_address || "Unknown");
-    const leadName = sanitize(email.from_name || email.from_address || "Unknown");
-    const fromInbox = sanitize(email.eaccount || email.to_address || "Unknown inbox");
-    const campaignName = sanitize(email.campaign_name || "Unknown campaign");
-    const subject = sanitize(email.subject || "(no subject)");
-    const body = sanitize(email.body || email.preview || "(no body)");
+    const leadEmail = escapeHtml(email.from_address || "Unknown");
+    const leadName = escapeHtml(email.from_name || email.from_address || "Unknown");
+    const fromInbox = escapeHtml(email.eaccount || email.to_address || "Unknown inbox");
+    const campaignName = escapeHtml(email.campaign_name || "Unknown campaign");
+    const subject = escapeHtml(email.subject || "(no subject)");
+    const receivedAt = formatDate(email.created_at || email.timestamp || email.date);
 
-    const message = [
-      `<b>📨 New Reply</b>`,
+    const rawBody = extractBody(email.body || email.preview);
+    const { reply, thread } = splitReplyAndThread(rawBody);
+
+    // Build message
+    const lines = [
+      `📨 <b>New Reply</b>`,
       ``,
       `<b>From:</b> ${leadName} (${leadEmail})`,
       `<b>Inbox:</b> ${fromInbox}`,
       `<b>Campaign:</b> ${campaignName}`,
       `<b>Subject:</b> ${subject}`,
+      `<b>Received:</b> ${receivedAt}`,
       ``,
-      `<b>Message:</b>`,
-      body,
-      ``,
-      `<i>Use Telegram Reply to respond to ${leadEmail}</i>`,
-    ].join("\n");
+      `─────────────────`,
+      `<b>Their reply:</b>`,
+      escapeHtml(reply.slice(0, 800)),
+    ];
+
+    if (thread) {
+      lines.push(``);
+      lines.push(`─────────────────`);
+      lines.push(`<b>Original email:</b>`);
+      lines.push(escapeHtml(thread.slice(0, 400)));
+    }
+
+    lines.push(``);
+    lines.push(`<i>Use Telegram Reply to respond to ${leadEmail}</i>`);
+
+    const message = lines.join("\n");
 
     try {
       const sentMsg = await sendTelegram(message);
@@ -138,12 +210,12 @@ app.post("/telegram-webhook", async (req, res) => {
       },
       { headers: { Authorization: `Bearer ${INSTANTLY_API_KEY}` } }
     );
-    await sendTelegram(`✅ Reply sent to <b>${sanitize(context.lead_email)}</b> from <b>${sanitize(context.from_inbox)}</b>`).catch(() => {});
+    await sendTelegram(`✅ Reply sent to <b>${escapeHtml(context.lead_email)}</b> from <b>${escapeHtml(context.from_inbox)}</b>`).catch(() => {});
     console.log(`[${new Date().toISOString()}] Reply sent to ${context.lead_email}`);
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error("Reply send error:", detail);
-    await sendTelegram(`❌ Failed to reply to ${sanitize(context.lead_email)}\n\n${sanitize(JSON.stringify(detail))}`).catch(() => {});
+    await sendTelegram(`❌ Failed to reply to ${escapeHtml(context.lead_email)}\n\n${escapeHtml(JSON.stringify(detail))}`).catch(() => {});
   }
 });
 
